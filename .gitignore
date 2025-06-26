@@ -15,3 +15,14 @@ slurm*
 tmp
 model/
 atlas
+
+notebooks/GRN-VAE/anndata_inputs
+notebooks/GRN-VAE/binary_matrices
+notebooks/GRN-VAE/pyviperdata
+notebooks/GRN-VAE/trained_models
+notebooks/GRN-VAE/genes_perturb
+notebooks/GRN-VAE/notebooks/cache
+
+
+
+

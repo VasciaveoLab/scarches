@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Union, Optional, List, Optional
 
 import torch
 import torch.nn as nn
@@ -10,6 +10,7 @@ from ..trvae.losses import mse, nb
 from .losses import hsic
 from ..trvae._utils import one_hot_encoder
 from ..base._base import CVAELatentsModelMixin
+
 
 
 class expiMap(nn.Module, CVAELatentsModelMixin):
@@ -220,3 +221,126 @@ class expiMap(nn.Module, CVAELatentsModelMixin):
             hsic_loss = torch.tensor(0.0, device=z1.device)
 
         return recon_loss, kl_div, hsic_loss
+    
+    def full_forward(self, x=None, batch=None, sizefactor=None, labeled=None):
+        """Extended forward: also returns encoder outputs, sampled z, and decoder outputs."""
+        # 1) Preprocess input
+        x_log = torch.log(1 + x)
+        if self.recon_loss == 'mse':
+            x_log = x
+
+        # 2) Pass through encoder
+        z1_mean, z1_log_var = self.encoder(x_log, batch)
+        # 3) Sample z
+        z1 = self.sampling(z1_mean, z1_log_var)
+        # 4) Decode
+        decoder_out = self.decoder(z1, batch)
+
+        # 6) Return losses + intermediates
+        return {
+            'z1_mean': z1_mean,
+            'z1_log_var': z1_log_var,
+            'z1': z1,
+            'decoder_out': decoder_out
+        }
+        
+    def forward_encoder(self, x, batch, n_samples=1):
+            """
+            Runs only the encoder part: returns mean, log-variance, and sampled latent z.
+            Can draw multiple z samples per input and average them.
+            
+            Parameters
+            ----------
+            x : Tensor of shape (n_obs, input_dim)
+            batch : LongTensor of shape (n_obs,)
+            n_samples : int, number of latent samples to draw (default=1)
+
+            Returns
+            -------
+            dict with keys:
+            'z1_mean'    : Tensor of shape (n_obs, latent_dim)
+            'z1_log_var' : Tensor of shape (n_obs, latent_dim)
+            'z1'         : Tensor of shape (n_obs, latent_dim) (averaged if n_samples>1)
+            """
+            x_log = torch.log(1 + x)
+            if self.recon_loss == 'mse':
+                x_log = x
+            z1_mean, z1_log_var = self.encoder(x_log, batch)
+
+            if n_samples == 1:
+                z1 = self.sampling(z1_mean, z1_log_var)
+            else:
+                samples = [self.sampling(z1_mean, z1_log_var) for _ in range(n_samples)]
+                z1 = torch.stack(samples, dim=0).mean(dim=0)
+
+            return {
+                'z1_mean': z1_mean,
+                'z1_log_var': z1_log_var,
+                'z1': z1
+            }
+
+    def forward_decoder(self, z, batch, sizefactor=None, n_samples=1):
+        """
+        Runs only the decoder part: reconstructs data from latent z and condition batch.
+        For NB reconstruction, can sample multiple cells per input and average them.
+        
+        Parameters
+        ----------
+        z : Tensor of shape (n_obs, latent_dim)
+        batch : LongTensor of shape (n_obs,)
+        sizefactor : Tensor or None
+        n_samples : int, number of NB samples per cell to generate (default=1)
+
+        Returns
+        -------
+        dict with keys:
+          'dec_mean'   : Tensor of shape (n_obs, n_genes)
+          'dispersion' : Tensor of shape (n_obs, n_genes)
+          'probs'      : Tensor of shape (n_obs, n_genes)
+          'sample'     : Tensor of shape (n_obs, n_genes) (averaged if n_cells>1)
+        """
+        # 1) Get decoder parameters
+        outputs = self.decoder(z, batch)
+
+        if self.recon_loss == 'nb':
+            # Unpack mean and ignore dropout head
+            dec_mean_gamma, _ = outputs
+            # Apply sizefactor if using softmax
+            if self.use_l_encoder and self.decoder_last_layer == 'softmax' and sizefactor is not None:
+                sf = sizefactor.unsqueeze(1).expand_as(dec_mean_gamma)
+                dec_mean = dec_mean_gamma * sf
+            else:
+                dec_mean = dec_mean_gamma
+
+            # Compute dispersion per gene & condition
+            one_hot = one_hot_encoder(batch, self.n_conditions)
+            dispersion = torch.exp(F.linear(one_hot, self.theta))
+
+            # Calculate NB probabilities and clamp
+            probs = dispersion / (dispersion + dec_mean + 1e-8)
+            probs = probs.clamp(min=1e-6, max=1 - 1e-6)
+
+            # Sample from NegativeBinomial, possibly multiple times
+            nb_dist = torch.distributions.NegativeBinomial(total_count=dispersion, probs=probs)
+            if n_samples == 1:
+                # single draw per cell
+                sample = nb_dist.sample()
+            else:
+                # sample_shape=(n_samples,) yields (n_samples, n_obs, n_genes)
+                reps = nb_dist.sample(sample_shape=(n_samples,))
+                # average across simulated cells -> (n_obs, n_genes)
+                sample = reps.float().mean(dim=0)
+
+            return {
+                'dec_mean': dec_mean,
+                'dispersion': dispersion,
+                'probs': probs,
+                'sample': sample
+            }
+
+        else:
+            # MSE: just return the reconstructed tensor (first output)
+            recon_x, _ = outputs
+            return recon_x
+        
+    

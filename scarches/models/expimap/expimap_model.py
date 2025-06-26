@@ -14,6 +14,19 @@ from ...trainers import expiMapTrainer
 from ..base._utils import _validate_var_names
 from ..base._base import BaseMixin, SurgeryMixin, CVAELatentsMixin
 
+import os
+# ─── limit BLAS/MKL threads to 1 per process ───────────────────────────
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"]      = "1"
+
+from concurrent.futures import ProcessPoolExecutor
+
+from typing import Union, Optional, List, Optional, Tuple
+
+from anndata import AnnData
+import scanpy as sc
+from scipy.sparse import issparse
+
 
 class EXPIMAP(BaseMixin, SurgeryMixin, CVAELatentsMixin):
     """Model for scArches class. This class contains the implementation of Conditional Variational Auto-encoder.
@@ -700,3 +713,399 @@ class EXPIMAP(BaseMixin, SurgeryMixin, CVAELatentsMixin):
         adata_conditions = adata.obs[dct['condition_key_']].unique().tolist()
         if not set(adata_conditions).issubset(dct['conditions_']):
             raise ValueError("Incorrect conditions")
+        
+
+    def pairwise_distances(self, A: np.ndarray, B: np.ndarray) -> np.ndarray:
+        na = np.einsum('ij,ij->i', A, A)
+        nb = np.einsum('ij,ij->i', B, B)
+        M  = A.dot(B.T)
+        D2 = na[:, None] + nb[None, :] - 2*M
+        np.maximum(D2, 0, out=D2)
+        return np.sqrt(D2, out=D2)
+
+    def energy_distance(self, A: np.ndarray, B: np.ndarray) -> float:
+        d_AB = self.pairwise_distances(A, B).mean()
+        d_AA = self.pairwise_distances(A, A).mean()
+        d_BB = self.pairwise_distances(B, B).mean()
+        return 2*d_AB - d_AA - d_BB
+
+    def _pairwise_task(self,args):
+        ci, cj, Xi, Xj = args
+        return ci, cj, self.energy_distance(Xi, Xj)
+
+    def e_distance(
+            self,
+            adata: AnnData,
+            cluster_key:   str = 'cluster',
+            embedding_key: str = 'X_expimap',
+            n_jobs:        int = None
+        ) -> pd.DataFrame:
+            """
+            Compute pairwise energy distances between clusters, then print and return
+            only the upper‐triangle (no NaNs) formatted to 4 decimal places.
+            """
+            # 1) Extract embedding and cluster labels
+            X        = adata.obsm[embedding_key]
+            labels   = adata.obs[cluster_key].astype(str).values
+            clusters = np.unique(labels)
+
+            # 2) Initialize full matrix
+            dist_df = pd.DataFrame(index=clusters, columns=clusters, dtype=float)
+
+            # 3) Decide number of workers
+            cpu = os.cpu_count() or 1
+            if   n_jobs is None:   max_workers = None
+            elif n_jobs == -1:     max_workers = cpu
+            elif n_jobs < -1:      max_workers = max(cpu + n_jobs + 1, 1)
+            else:                  max_workers = n_jobs
+
+            # 4) Slice out each cluster’s points
+            data = {c: X[labels == c] for c in clusters}
+
+            # 5) Build tasks for upper triangle only
+            tasks = [
+                (ci, cj, data[ci], data[cj])
+                for i, ci in enumerate(clusters)
+                for cj in clusters[i:]
+            ]
+
+            # 6) Compute distances in parallel
+            with ProcessPoolExecutor(max_workers=max_workers) as exe:
+                for ci, cj, d in exe.map(self._pairwise_task, tasks):
+                    dist_df.at[ci, cj] = d
+                    dist_df.at[cj, ci] = d
+
+            # 7) Mask out the lower triangle
+            mask   = np.tril(np.ones(dist_df.shape, dtype=bool), k=-1)
+            tri_df = dist_df.where(~mask)
+
+            # 8) Print with 4 decimals, blanks instead of NaN
+            print(
+                tri_df.to_string(
+                    float_format="{:.4f}".format,
+                    na_rep=""
+                )
+            )
+
+            # 9) Return the triangular DataFrame
+            return tri_df
+    
+    def _resolve_genes(self,
+                       adata: AnnData,
+                       genes: Union[str, List[str], int, List[int]]
+                       ) -> List[int]:
+        """Turn gene name(s) or index(es) into a list of var‐indices."""
+        # normalize to list
+        g_list = [genes] if isinstance(genes, (str, int)) else genes
+        idx: List[int] = []
+        for g in g_list:
+            if isinstance(g, str):
+                if g in adata.var_names:
+                    idx.append(adata.var_names.get_loc(g))
+                else:
+                    raise ValueError(f"Gene '{g}' not found in adata.var_names")
+            elif isinstance(g, int):
+                if 0 <= g < adata.n_vars:
+                    idx.append(g)
+                else:
+                    raise IndexError(f"Gene index {g} out of bounds [0, {adata.n_vars})")
+            else:
+                raise TypeError("`genes` must be str, int, or list thereof")
+        return idx
+    
+
+    def _resolve_programs(self,
+                        adata: AnnData,
+                        programs: Union[str, List[str], int, List[int]]
+                        ) -> List[int]:
+        
+        """Turn program name(s) or index(es) into a list of indices in adata.uns['terms']."""
+        terms = adata.uns.get('terms', None)
+        if terms is None:
+            raise KeyError("adata.uns['terms'] not found—needed to resolve programs")
+        # ensure list
+        if isinstance(terms, np.ndarray):
+            terms = terms.tolist()
+        p_list = [programs] if isinstance(programs, (str, int)) else programs
+        pid: List[int] = []
+        for p in p_list:
+            if isinstance(p, str):
+                if p in terms:
+                    pid.append(terms.index(p))
+                else:
+                    raise ValueError(f"Program '{p}' not found in adata.uns['terms']")
+            elif isinstance(p, int):
+                if 0 <= p < len(terms):
+                    pid.append(p)
+                else:
+                    raise IndexError(f"Program index {p} out of bounds [0, {len(terms)})")
+            else:
+                raise TypeError("`programs` must be str, int, or list thereof")
+        return pid
+    
+
+    #adata_cat.uns['df_pert_genes_diffs'] = df_genes
+    #adata_cat.uns['df_pert_programs_diffs'] = df_programs
+
+    def perturb_genes(self,
+                      adata: AnnData,
+                      genes: Optional[Union[str, List[str], int, List[int]]] = None,
+                      perturb_type: str = 'none',
+                      group_key: str = '',
+                      category: Union[str, int] = None,
+                      condition_key: str = '',
+                      new_condition: Optional[Union[str, int]] = None,
+                      obs_key: str = 'perturbation',
+                      batch_categories: Optional[List[str]] = None
+                      ) -> Tuple[AnnData, pd.DataFrame, pd.DataFrame]:
+        """
+        Now supports genes=None for pure condition‐relabel.  
+        Renames group_key → f"{group_key}_perturb" with "old --> new".
+        """
+        # 1) Prepare new grouping column
+        new_group_key = f"{group_key}_perturb"
+        adata.obs[new_group_key] = adata.obs[group_key].astype(str)
+
+        # 2) Figure out mask of cells to “perturb”
+        adata.obs[obs_key] = (batch_categories or ['orig','pert'])[0]
+        mask = adata.obs[group_key] == category
+        adata_sub = adata[mask].copy()
+        adata_sub.obs[obs_key] = (batch_categories or ['orig','pert'])[1]
+
+        # 3) Write new group label
+        if new_condition is not None:
+            # condition‐relabel mode
+            label = f"{category} --> {new_condition}"
+            adata_sub.obs[condition_key] = new_condition
+        else:
+            # gene KO/OE mode
+            label = f"{category}_perturb"
+        adata_sub.obs[new_group_key] = label
+
+        # 4) If genes provided, do KO / overexpression
+        if genes:
+            idx = self._resolve_genes(adata, genes)
+            Xsub = (adata_sub.X.toarray() if issparse(adata_sub.X)
+                    else adata_sub.X.copy())
+            if perturb_type.lower() == 'ko':
+                Xsub[:, idx] = 0
+            elif perturb_type.lower() == 'overexpression':
+                Xsub[:, idx] = Xsub[:, idx].max(axis=0)
+            else:
+                raise ValueError("perturb_type must be 'KO' or 'Overexpression'")
+            adata_sub.X = Xsub
+
+        # 5) Concatenate
+        adata_cat = sc.concat(
+            [adata, adata_sub],
+            join='outer',
+            label=obs_key,
+            keys=[adata.obs[obs_key].unique()[0],
+                  adata_sub.obs[obs_key].unique()[0]]
+        )
+
+        # 6) Build the condition‐batch vector from the **original** condition_key
+        orig_codes = adata.obs[condition_key].map(self.model.condition_encoder).values
+        sub_codes  = adata_sub.obs[condition_key].map(self.model.condition_encoder).values
+        batch_vec  = np.concatenate([orig_codes, sub_codes])
+        device     = next(self.model.parameters()).device
+        batch      = torch.tensor(batch_vec, dtype=torch.long, device=device)
+
+        # 7) Encode all cells
+        Xfull = (adata_cat.X.toarray() if issparse(adata_cat.X)
+                 else adata_cat.X)
+        x      = torch.tensor(Xfull, dtype=torch.float32, device=device)
+        enc    = self.model.forward_encoder(x, batch, n_samples=1)
+        z_all  = enc['z1_mean']
+        adata_cat.obsm['z1_mean_all'] = z_all.detach().cpu().numpy()
+
+        # 8) Decode all cells
+        dec     = self.model.forward_decoder(z_all, batch,
+                                             sizefactor=None,
+                                             n_samples=1)
+        dec_mean= dec['dec_mean'].detach().cpu().numpy()
+        adata_cat.layers['perturbed_dec_mean'] = dec_mean
+        adata_cat.X = dec_mean
+
+        # 9) Compute diffs for only the “perturbed” cells
+        orig_label = adata.obs[obs_key].unique()[0]
+        pert_label = adata_sub.obs[obs_key].unique()[0]
+        mask_o = (adata_cat.obs[obs_key] == orig_label) & \
+                 (adata_cat.obs[new_group_key] == str(category))
+        mask_p = (adata_cat.obs[obs_key] == pert_label) & \
+                 (adata_cat.obs[new_group_key] == label)
+
+        # genes
+        mu_o = dec_mean[mask_o.values].mean(axis=0)
+        mu_p = dec_mean[mask_p.values].mean(axis=0)
+        raw  = mu_p - mu_o
+        df_genes = pd.DataFrame({
+            'gene_index': np.arange(dec_mean.shape[1]),
+            'gene_name' : adata_cat.var_names,
+            'raw_diff'  : raw,
+            'abs_diff'  : np.abs(raw)
+        }).sort_values('abs_diff', ascending=False).reset_index(drop=True)
+
+        # programs
+        Z       = z_all.detach().cpu().numpy()
+        mu_o_z  = Z[mask_o.values].mean(axis=0)
+        mu_p_z  = Z[mask_p.values].mean(axis=0)
+        raw_z   = mu_p_z - mu_o_z
+        terms   = adata.uns.get('terms', None)
+        names   = list(terms) if terms is not None else list(range(Z.shape[1]))
+        df_programs = pd.DataFrame({
+            'program_index': np.arange(Z.shape[1]),
+            'program_name' : names,
+            'raw_diff'     : raw_z,
+            'abs_diff'     : np.abs(raw_z)
+        }).sort_values('abs_diff', ascending=False).reset_index(drop=True)
+
+        adata_cat.uns['df_pert_genes_diffs'] = df_genes
+        adata_cat.uns['df_pert_programs_diffs'] = df_programs
+
+        return adata_cat
+
+
+    def perturb_gps(self,
+                    adata: AnnData,
+                    programs: Optional[Union[str, List[str], int, List[int]]] = None,
+                    perturb_type: str = 'none',
+                    group_key: str = '',
+                    category: Union[str, int] = None,
+                    condition_key: str = '',
+                    new_condition: Optional[Union[str, int]] = None,
+                    latent_key: str = 'X_expimap',
+                    obs_key: str = 'perturbation',
+                    sizefactor: Optional[torch.Tensor] = None,
+                    n_samples: int = 1
+                ) -> Tuple[AnnData, pd.DataFrame, pd.DataFrame]:
+        """
+        Same signature as before, but we:
+        - encode with the original condition,
+        - then (optionally) re‐label only for decoding,
+        - then decode under the new condition to isolate its effect.
+        """
+        # 0) Make a new _perturb column so we never touch the real group_key
+        new_group_key = f"{group_key}_perturb"
+        adata.obs[new_group_key] = adata.obs[group_key].astype(str)
+
+        # 1) Subset out your “perturbation” group
+        adata.obs[obs_key] = 'orig'
+        mask       = adata.obs[group_key] == category
+        adata_sub  = adata[mask].copy()
+        adata_sub.obs[obs_key] = 'pert'
+        # label in the new column
+        if new_condition is not None:
+            label = f"{category} --> {new_condition}"
+        else:
+            label = f"{category}_perturb"
+        adata_sub.obs[new_group_key] = label
+
+        # 2) Optionally do KO/OE in latent‐space
+        if programs:
+            pid = self._resolve_programs(adata, programs)
+        else:
+            pid = []
+        # concat original + subset
+        adata_cat = sc.concat([adata, adata_sub],
+                            join='outer',
+                            label=obs_key,
+                            keys=['orig','pert'])
+
+        # 3) Build batch for **encoding** (always the original condition)
+        cond_orig = adata.obs[condition_key].map(self.model.condition_encoder).values
+        cond_sub  = adata_sub.obs[condition_key].map(self.model.condition_encoder).values
+        batch_enc = torch.tensor(np.concatenate([cond_orig, cond_sub]),
+                                dtype=torch.long,
+                                device=next(self.model.parameters()).device)
+
+        # 4) Encode everything once
+        Xfull = (adata_cat.X.toarray() if issparse(adata_cat.X)
+                else adata_cat.X)
+        x      = torch.tensor(Xfull, dtype=torch.float32, device=batch_enc.device)
+        enc    = self.model.forward_encoder(x, batch_enc, n_samples=n_samples)
+        z_raw  = enc['z1_mean']
+        adata_cat.obsm[latent_key + '_raw'] = z_raw.detach().cpu().numpy()
+
+        # 5) Apply any latent KO/OE
+        z_mod = z_raw.clone()
+        if programs:
+            pert_mask = (adata_cat.obs[obs_key] == 'pert').values
+            if perturb_type.lower() == 'ko':
+                z_mod[pert_mask, pid] = 0
+            else:  # overexpression
+                maxv = z_mod[pert_mask][:, pid].max(dim=0).values
+                z_mod[pert_mask, pid] = maxv
+        adata_cat.obsm[latent_key + '_pert'] = z_mod.detach().cpu().numpy()
+
+        # 6) **Now** re‐label the condition in adata_sub, and build a **new** batch for decoding
+        if new_condition is not None:
+            # overwrite only the copy’s condition
+            adata_sub.obs[condition_key] = new_condition
+        # build decode‐batch: original cells keep their old code, perturbed get new
+        cond_sub_decode = (
+            np.full_like(cond_sub, self.model.condition_encoder[new_condition])
+            if new_condition is not None
+            else cond_sub
+        )
+        batch_dec = torch.tensor(np.concatenate([cond_orig, cond_sub_decode]),
+                                dtype=torch.long,
+                                device=batch_enc.device)
+
+        # 7) Decode under the new batch
+        dec = self.model.forward_decoder(z_mod, batch_dec,
+                                        sizefactor=sizefactor,
+                                        n_samples=n_samples)
+        dec_mean = dec['dec_mean'].detach().cpu().numpy()
+        adata_cat.layers['perturbed_dec_mean'] = dec_mean
+        adata_cat.X = dec_mean
+
+        # 8) Compute diffs exactly as before
+        mask_o = (adata_cat.obs[obs_key]       == 'orig') & \
+                (adata_cat.obs[new_group_key] == str(category))
+        mask_p = (adata_cat.obs[obs_key]       == 'pert') & \
+                (adata_cat.obs[new_group_key] == label)
+
+        # gene‐level diffs
+        mu_o = dec_mean[mask_o].mean(axis=0)
+        mu_p = dec_mean[mask_p].mean(axis=0)
+        raw  = mu_p - mu_o
+        df_genes = pd.DataFrame({
+            'gene_index': np.arange(dec_mean.shape[1]),
+            'gene_name' : adata_cat.var_names,
+            'raw_diff'  : raw,
+            'abs_diff'  : np.abs(raw)
+        }).sort_values('abs_diff', ascending=False).reset_index(drop=True)
+
+        # program diffs (latent‐space itself didn’t change unless KO/OE)
+        Zr = z_raw.detach().cpu().numpy()
+        Zp = z_mod.detach().cpu().numpy()
+        mu_o_z = Zr[mask_p].mean(axis=0)
+        mu_p_z = Zp[mask_p].mean(axis=0)
+        raw_z  = mu_p_z - mu_o_z
+        terms  = adata.uns.get('terms', None)
+        names  = list(terms) if terms is not None else list(range(Zp.shape[1]))
+        df_programs = pd.DataFrame({
+            'program_index': np.arange(Zp.shape[1]),
+            'program_name' : names,
+            'raw_diff'     : raw_z,
+            'abs_diff'     : np.abs(raw_z)
+        }).sort_values('abs_diff', ascending=False).reset_index(drop=True)
+
+
+        adata_cat.uns['df_pert_genes_diffs'] = df_genes
+        adata_cat.uns['df_pert_programs_diffs'] = df_programs
+
+        return adata_cat
+
+
+
+
+
+
+
+
+
+
+
+
