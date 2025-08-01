@@ -49,84 +49,108 @@ def plot_abs_bfs_key(
 
     return ax.figure
 
+import numpy as np
+import matplotlib.pyplot as plt
+from itertools import product
+from typing import Union, List
 
 def plot_abs_bfs(
     adata,
     scores_key: str = "bf_scores",
-    terms: Union[str, list] = "terms",
-    keys=None,
+    terms: Union[str, List[str]] = "terms",
+    keys: Union[None, str, List[str]] = None,
     n_cols: int = 3,
     figsize=None,
-    n_points: int = 5,         # ← exposes the number of top genes
+    n_points: int = 5,         # ← number of top features per plot
     **kwargs
 ):
     """
-    Plot the absolute Bayes factor score rankings.
+    Plot the absolute Bayes factor score rankings for one or more groups.
 
     Parameters
     ----------
     adata : AnnData
         Annotated data object containing Bayes factor scores.
     scores_key : str
-        Key in `adata.uns` containing the Bayes factor scores.
+        Key in `adata.uns` containing the Bayes factor scores dict.
+        Expected shape: adata.uns[scores_key][group]["bf"] → 1D array.
     terms : str or list
-        Terms to label the features. If str, will be interpreted as a key in `adata.uns`.
-    keys : list or str
-        Specific score keys to plot.
+        Labels for features. If str, taken from `adata.uns[terms]`.
+    keys : None, "all", str, or list of str
+        Which group‐keys to plot. If None or "all", plots every group.
+        If a single str, returns just that one plot.
+        If list of str, plots those in a grid.
     n_cols : int
-        Number of columns in the subplot grid.
-    figsize : tuple
-        Figure size in inches (width, height). Optional.
+        Number of columns in the subplot grid (for multi‐plot).
+    figsize : tuple, optional
+        Figure size (width, height). If None, auto‐scaled.
     n_points : int
-        Number of top genes to display per plot.
+        How many top features (genes) to show per plot.
     kwargs : dict
-        Additional keyword arguments passed to `plot_abs_bfs_key`.
+        Passed through to `plot_abs_bfs_key`.
 
     Returns
     -------
     fig : matplotlib.figure.Figure
-        The resulting matplotlib figure, or a single figure if `keys` is str.
+        If one group, returns that Axes’ Figure; if multiple, returns the full Figure.
     """
     scores = adata.uns[scores_key]
 
+    # resolve terms
     if isinstance(terms, str):
         terms = np.asarray(adata.uns[terms])
     else:
         terms = np.asarray(terms)
 
-    if len(terms) != len(next(iter(scores.values()))["bf"]):
-        raise ValueError("Incorrect length of terms.")
+    # pick feature‐label length
+    first_group = next(iter(scores.values()))
+    n_feats = len(first_group["bf"])
+    if len(terms) != n_feats:
+        raise ValueError(f"length of `terms` ({len(terms)}) "
+                         f"!= number of features ({n_feats})")
 
-    # if just one key, dispatch to the single‐plot version
-    if isinstance(keys, str):
+    # --- determine which groups to plot ---
+    if keys is None or keys == "all":
+        plot_groups = list(scores.keys())
+    elif isinstance(keys, str):
+        if keys not in scores:
+            raise KeyError(f"Group '{keys}' not found in {scores_key}")
+        plot_groups = [keys]
+    elif isinstance(keys, (list, tuple)):
+        missing = [k for k in keys if k not in scores]
+        if missing:
+            raise KeyError(f"Groups {missing} not found in {scores_key}")
+        plot_groups = list(keys)
+    else:
+        raise ValueError("`keys` must be None, 'all', a str, or list of str")
+
+    # single‐plot shortcut
+    if len(plot_groups) == 1:
         return plot_abs_bfs_key(
-            scores, terms, keys,
-            n_points=n_points,  # ← pass it along
+            scores, terms, plot_groups[0],
+            n_points=n_points,
             **kwargs
         )
 
-    # otherwise, grid of plots
-    if keys is None:
-        keys = list(scores.keys())
-    n_keys = len(keys)
+    # multi‐plot grid
+    n_keys = len(plot_groups)
     n_rows = int(np.ceil(n_keys / n_cols))
-
     if figsize is None:
         figsize = (n_cols * 4, n_rows * 3)
 
     fig, axs = plt.subplots(n_rows, n_cols, figsize=figsize)
     axs = np.array(axs).reshape(n_rows, n_cols)
 
-    for key, (i, j) in zip(keys, product(range(n_rows), range(n_cols))):
+    for key, (i, j) in zip(plot_groups, product(range(n_rows), range(n_cols))):
         plot_abs_bfs_key(
             scores, terms, key,
-            n_points=n_points,  # ← pass it along
+            n_points=n_points,
             ax=axs[i, j],
             **kwargs
         )
 
-    # turn off any unused axes
-    for idx in range(len(keys), n_rows * n_cols):
+    # turn off unused axes
+    for idx in range(n_keys, n_rows * n_cols):
         i, j = divmod(idx, n_cols)
         axs[i, j].axis("off")
 

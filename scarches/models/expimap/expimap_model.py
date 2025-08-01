@@ -1097,6 +1097,60 @@ class EXPIMAP(BaseMixin, SurgeryMixin, CVAELatentsMixin):
         adata_cat.uns['df_pert_programs_diffs'] = df_programs
 
         return adata_cat
+    
+    @staticmethod
+    def differential_expression(
+        adata,
+        groupby,
+        method="wilcoxon",
+        layer=None,
+        groups_to_compare=None,
+        reference=None
+    ):
+        """
+        Run differential gene expression with optional subsetting.
+
+        Parameters
+        ----------
+        adata : AnnData
+        groupby : str
+        method : str
+        layer : str or None
+        groups_to_compare : list[str] or None or "all"
+            If list: only compare those groups.
+            If None or "all": compare all groups (one-vs-rest).
+        reference : str or None
+            If str: compare `groups_to_compare` vs this group.
+            If None: use Scanpy default ("rest").
+        """
+        # 1) Subset to just your groups, if requested
+        if groups_to_compare not in (None, "all"):
+            adata = adata[adata.obs[groupby].isin(groups_to_compare)].copy()
+            adata.obs[groupby] = adata.obs[groupby].astype("category")
+            print(f"Subsetted to groups: {groups_to_compare}")
+        
+        # 2) Build the kwargs for Scanpy cleanly
+        sc_kwargs = dict(
+            adata=adata,
+            groupby=groupby,
+            method=method,
+        )
+        if layer is not None:
+            sc_kwargs["layer"] = layer
+        # only set `groups=` when you really want a subset
+        if groups_to_compare not in (None, "all"):
+            sc_kwargs["groups"] = groups_to_compare
+        # only set `reference=` when user specified one
+        if reference is not None:
+            sc_kwargs["reference"] = reference
+        
+        # 3) Run Scanpy
+        sc.tl.rank_genes_groups(**sc_kwargs)
+        print("Differential expression completed.")
+        return adata
+
+
+
 
 
 
